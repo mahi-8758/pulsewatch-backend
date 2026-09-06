@@ -7,15 +7,18 @@ const {
   PutCommand,
   UpdateCommand,
 } = require('@aws-sdk/lib-dynamodb')
-const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns')
+const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses')
+const { CognitoIdentityProviderClient, AdminGetUserCommand } = require('@aws-sdk/client-cognito-identity-provider')
 
 const dynamoClient = DynamoDBDocumentClient.from(new DynamoDBClient({}))
-const snsClient = new SNSClient({})
+const sesClient = new SESClient({})
+const cognitoClient = new CognitoIdentityProviderClient({})
 
 const TARGETS_TABLE = process.env.TARGETS_TABLE || 'MonitorTargets'
 const RESULTS_TABLE = process.env.RESULTS_TABLE || 'CheckResults'
 const INCIDENTS_TABLE = process.env.INCIDENTS_TABLE || 'Incidents'
-const SNS_TOPIC_ARN = process.env.SNS_TOPIC_ARN
+const SENDER_EMAIL = process.env.SENDER_EMAIL || process.env.ALERT_EMAIL
+const USER_POOL_ID = process.env.USER_POOL_ID
 const REQUEST_TIMEOUT_MS = 8000
 
 function checkUrl(url) {
@@ -82,21 +85,72 @@ async function scanAllTargets() {
   return targets
 }
 
-async function publishTransition(target, status) {
-  const direction = status === 'down' ? 'DOWN' : 'BACK UP'
-  const message = `PulseWatch Alert: ${target.label} is ${direction}`
+async function resolveOwnerEmail(target) {
+  if (target.ownerEmail) {
+    return target.ownerEmail
+  }
 
-  if (!SNS_TOPIC_ARN) {
-    console.error('SNS_TOPIC_ARN is not configured; notification was not sent')
+  if (target.ownerId && USER_POOL_ID) {
+    try {
+      const cognitoUser = await cognitoClient.send(new AdminGetUserCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: target.ownerId,
+      }))
+      const emailAttr = cognitoUser.UserAttributes?.find((attr) => attr.Name === 'email')?.Value
+      if (emailAttr) {
+        await dynamoClient.send(new UpdateCommand({
+          TableName: TARGETS_TABLE,
+          Key: { targetId: target.targetId },
+          UpdateExpression: 'SET ownerEmail = :ownerEmail',
+          ExpressionAttributeValues: { ':ownerEmail': emailAttr },
+        })).catch((err) => console.error(`Failed to backfill ownerEmail for ${target.targetId}:`, err))
+
+        return emailAttr
+      }
+    } catch (err) {
+      console.error(`Failed to lookup owner email for ownerId ${target.ownerId} in Cognito:`, err.message)
+    }
+  }
+
+  if (target.ownerId && typeof target.ownerId === 'string' && target.ownerId.includes('@')) {
+    return target.ownerId
+  }
+
+  return null
+}
+
+async function publishTransition(target, status) {
+  const recipientEmail = await resolveOwnerEmail(target)
+
+  if (!recipientEmail) {
+    console.error(`No recipient email resolved for target ${target.targetId} (ownerId: ${target.ownerId}); notification skipped.`)
     return
   }
 
-  await snsClient.send(new PublishCommand({
-    TopicArn: SNS_TOPIC_ARN,
-    Subject: message,
-    Message: message,
-  }))
-  console.log(`Published SNS notification: ${message}`)
+  if (!SENDER_EMAIL) {
+    console.error('SENDER_EMAIL is not configured; notification was not sent.')
+    return
+  }
+
+  const direction = status === 'down' ? 'DOWN' : 'BACK UP'
+  const subject = `PulseWatch Alert: ${target.label} is ${direction}`
+  const bodyText = `Hello,\n\nYour monitor target "${target.label}" (${target.url}) is now ${direction}.\n\nChecked At: ${new Date().toISOString()}\n\n- PulseWatch Monitoring`
+
+  try {
+    await sesClient.send(new SendEmailCommand({
+      Source: SENDER_EMAIL,
+      Destination: {
+        ToAddresses: [recipientEmail],
+      },
+      Message: {
+        Subject: { Data: subject },
+        Body: { Text: { Data: bodyText } },
+      },
+    }))
+    console.log(`Sent SES alert to ${recipientEmail} for target ${target.targetId} (${target.label} is ${direction})`)
+  } catch (error) {
+    console.error(`Failed to send SES alert to ${recipientEmail} for target ${target.targetId}:`, error)
+  }
 }
 
 async function processTarget(target) {

@@ -1,3 +1,5 @@
+const http = require('http')
+const https = require('https')
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb')
 const {
   DynamoDBDocumentClient,
@@ -5,15 +7,24 @@ const {
   PutCommand,
   QueryCommand,
   ScanCommand,
+  UpdateCommand,
   DeleteCommand,
 } = require('@aws-sdk/lib-dynamodb')
-const { v4: uuidv4 } = require('uuid')
+const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses')
+const { CognitoIdentityProviderClient, AdminGetUserCommand } = require('@aws-sdk/client-cognito-identity-provider')
+const { randomUUID } = require('crypto')
+const uuidv4 = () => randomUUID()
 
 const dynamoClient = DynamoDBDocumentClient.from(new DynamoDBClient({}))
+const sesClient = new SESClient({})
+const cognitoClient = new CognitoIdentityProviderClient({})
 
 const TARGETS_TABLE = process.env.TARGETS_TABLE || 'MonitorTargets'
 const RESULTS_TABLE = process.env.RESULTS_TABLE || 'CheckResults'
 const INCIDENTS_TABLE = process.env.INCIDENTS_TABLE || 'Incidents'
+const SENDER_EMAIL = process.env.SENDER_EMAIL || process.env.ALERT_EMAIL
+const USER_POOL_ID = process.env.USER_POOL_ID
+const REQUEST_TIMEOUT_MS = 8000
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -32,6 +43,15 @@ function response(statusCode, body) {
 
 function getOwnerId(event) {
   return event?.requestContext?.authorizer?.claims?.sub
+}
+
+function getOwnerEmail(event) {
+  const claims = event?.requestContext?.authorizer?.claims
+  if (!claims) return null
+  if (claims.email) return claims.email
+  const username = claims['cognito:username'] || claims.username
+  if (username && typeof username === 'string' && username.includes('@')) return username
+  return null
 }
 
 function getMethod(event) {
@@ -97,9 +117,12 @@ async function createTarget(event, ownerId) {
     return response(400, { message: 'url must use http:// or https://' })
   }
 
+  const ownerEmail = getOwnerEmail(event)
+
   const target = {
     targetId: uuidv4(),
     ownerId,
+    ...(ownerEmail ? { ownerEmail } : {}),
     url: body.url,
     label: body.label,
     createdAt: new Date().toISOString(),
@@ -212,6 +235,194 @@ async function deleteTarget(event, ownerId, targetId) {
   return response(200, { message: 'Target deleted successfully' })
 }
 
+function checkUrl(url) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now()
+    let parsedUrl
+
+    try {
+      parsedUrl = new URL(url)
+      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        throw new Error('URL must use http:// or https://')
+      }
+    } catch (error) {
+      resolve({
+        statusCode: 0,
+        responseTimeMs: Date.now() - startedAt,
+        isUp: false,
+        error: error.message,
+      })
+      return
+    }
+
+    const transport = parsedUrl.protocol === 'https:' ? https : http
+    const request = transport.get(parsedUrl, { headers: { 'User-Agent': 'PulseWatch-Checker/1.0' } }, (response) => {
+      const statusCode = response.statusCode || 0
+      response.resume()
+      response.on('end', () => {
+        resolve({
+          statusCode,
+          responseTimeMs: Date.now() - startedAt,
+          isUp: statusCode < 400,
+        })
+      })
+    })
+
+    request.setTimeout(REQUEST_TIMEOUT_MS, () => {
+      request.destroy(new Error(`Request timed out after ${REQUEST_TIMEOUT_MS}ms`))
+    })
+
+    request.on('error', (error) => {
+      resolve({
+        statusCode: 0,
+        responseTimeMs: Date.now() - startedAt,
+        isUp: false,
+        error: error.message,
+      })
+    })
+  })
+}
+
+async function resolveOwnerEmail(target) {
+  if (target.ownerEmail) {
+    return target.ownerEmail
+  }
+
+  if (target.ownerId && USER_POOL_ID) {
+    try {
+      const cognitoUser = await cognitoClient.send(new AdminGetUserCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: target.ownerId,
+      }))
+      const emailAttr = cognitoUser.UserAttributes?.find((attr) => attr.Name === 'email')?.Value
+      if (emailAttr) {
+        await dynamoClient.send(new UpdateCommand({
+          TableName: TARGETS_TABLE,
+          Key: { targetId: target.targetId },
+          UpdateExpression: 'SET ownerEmail = :ownerEmail',
+          ExpressionAttributeValues: { ':ownerEmail': emailAttr },
+        })).catch((err) => console.error(`Failed to backfill ownerEmail for ${target.targetId}:`, err))
+
+        return emailAttr
+      }
+    } catch (err) {
+      console.error(`Failed to lookup owner email for ownerId ${target.ownerId} in Cognito:`, err.message)
+    }
+  }
+
+  if (target.ownerId && typeof target.ownerId === 'string' && target.ownerId.includes('@')) {
+    return target.ownerId
+  }
+
+  return null
+}
+
+async function publishTransition(target, status) {
+  const recipientEmail = await resolveOwnerEmail(target)
+
+  if (!recipientEmail) {
+    console.error(`No recipient email resolved for target ${target.targetId} (ownerId: ${target.ownerId}); notification skipped.`)
+    return
+  }
+
+  if (!SENDER_EMAIL) {
+    console.error('SENDER_EMAIL is not configured; notification was not sent.')
+    return
+  }
+
+  const direction = status === 'down' ? 'DOWN' : 'BACK UP'
+  const subject = `PulseWatch Alert: ${target.label} is ${direction}`
+  const bodyText = `Hello,\n\nYour monitor target "${target.label}" (${target.url}) is now ${direction}.\n\nChecked At: ${new Date().toISOString()}\n\n- PulseWatch Monitoring`
+
+  try {
+    await sesClient.send(new SendEmailCommand({
+      Source: SENDER_EMAIL,
+      Destination: {
+        ToAddresses: [recipientEmail],
+      },
+      Message: {
+        Subject: { Data: subject },
+        Body: { Text: { Data: bodyText } },
+      },
+    }))
+    console.log(`Sent SES alert to ${recipientEmail} for target ${target.targetId} (${target.label} is ${direction})`)
+  } catch (error) {
+    console.error(`Failed to send SES alert to ${recipientEmail} for target ${target.targetId}:`, error)
+  }
+}
+
+async function checkTarget(event, ownerId, targetId) {
+  if (!targetId) return response(400, { message: 'targetId is required' })
+
+  const result = await dynamoClient.send(new GetCommand({
+    TableName: TARGETS_TABLE,
+    Key: { targetId },
+  }))
+
+  const target = result?.Item
+  if (!target) return response(404, { message: 'Target not found' })
+
+  if (target.ownerId !== ownerId) {
+    return response(403, { message: 'Forbidden: You do not own this monitor' })
+  }
+
+  const checkRes = await checkUrl(target.url)
+  const status = checkRes.isUp ? 'up' : 'down'
+  const checkedAt = new Date().toISOString()
+
+  await dynamoClient.send(new PutCommand({
+    TableName: RESULTS_TABLE,
+    Item: {
+      targetId,
+      checkedAt,
+      statusCode: checkRes.statusCode,
+      responseTimeMs: checkRes.responseTimeMs,
+      isUp: checkRes.isUp,
+    },
+  }))
+
+  await dynamoClient.send(new UpdateCommand({
+    TableName: TARGETS_TABLE,
+    Key: { targetId },
+    UpdateExpression: 'SET lastStatus = :lastStatus',
+    ExpressionAttributeValues: { ':lastStatus': status },
+  }))
+
+  const previousStatus = typeof target.lastStatus === 'string'
+    ? target.lastStatus.toLowerCase()
+    : undefined
+
+  if (previousStatus && previousStatus !== status) {
+    console.log(`Instant check status transition for ${targetId}: ${previousStatus} -> ${status}`)
+    await dynamoClient.send(new PutCommand({
+      TableName: INCIDENTS_TABLE,
+      Item: {
+        targetId,
+        startedAt: checkedAt,
+        label: target.label,
+        url: target.url,
+        status,
+        message: status === 'down' ? 'Target is down' : 'Target is back up',
+      },
+    }))
+    await publishTransition(target, status)
+  }
+
+  const responseBody = {
+    targetId,
+    isUp: checkRes.isUp,
+    statusCode: checkRes.statusCode,
+    responseTimeMs: checkRes.responseTimeMs,
+    checkedAt,
+  }
+
+  if (checkRes.error) {
+    responseBody.error = checkRes.error
+  }
+
+  return response(200, responseBody)
+}
+
 exports.handler = async (event) => {
   try {
     const method = getMethod(event)
@@ -221,12 +432,15 @@ exports.handler = async (event) => {
     if (!ownerId) return response(401, { message: 'Authentication required' })
 
     const path = getPath(event)
-    const targetId = event.pathParameters?.targetId
+    const targetId = event.pathParameters?.targetId || (path.startsWith('/targets/') ? path.split('/')[2] : null)
     if (method === 'POST' && path === '/targets') return await createTarget(event, ownerId)
     if (method === 'GET' && path === '/targets') {
       return response(200, await getTargetsForOwner(ownerId))
     }
-    if (method === 'DELETE' && (path === '/targets/{targetId}' || (path.startsWith('/targets/') && targetId))) {
+    if (method === 'POST' && (path === '/targets/{targetId}/check' || (path.startsWith('/targets/') && path.endsWith('/check') && targetId))) {
+      return await checkTarget(event, ownerId, targetId)
+    }
+    if (method === 'DELETE' && (path === '/targets/{targetId}' || (path.startsWith('/targets/') && targetId && !path.endsWith('/check')))) {
       return await deleteTarget(event, ownerId, targetId)
     }
     if (method === 'GET' && path === '/history/{targetId}') {
